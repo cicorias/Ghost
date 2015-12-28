@@ -1,140 +1,252 @@
-var when                   = require('when'),
-    _                      = require('lodash'),
-    dataProvider           = require('../models'),
-    canThis                = require('../permissions').canThis,
-    filteredUserAttributes = require('./users').filteredAttributes,
+// # Posts API
+// RESTful API for the Post resource
+var Promise         = require('bluebird'),
+    _               = require('lodash'),
+    dataProvider    = require('../models'),
+    errors          = require('../errors'),
+    utils           = require('./utils'),
+    pipeline        = require('../utils/pipeline'),
+
+    docName         = 'posts',
+    allowedIncludes = [
+        'created_by', 'updated_by', 'published_by', 'author', 'tags', 'fields',
+        'next', 'previous', 'next.author', 'next.tags', 'previous.author', 'previous.tags'
+    ],
     posts;
 
-function checkPostData(postData) {
-    if (_.isEmpty(postData) || _.isEmpty(postData.posts) || _.isEmpty(postData.posts[0])) {
-        return when.reject({code: 400, message: 'No root key (\'posts\') provided.'});
-    }
-    return when.resolve(postData);
-}
+/**
+ * ### Posts API Methods
+ *
+ * **See:** [API Methods](index.js.html#api%20methods)
+ */
 
-// ## Posts
 posts = {
-
-    // #### Browse
-    // **takes:** filter / pagination parameters
+    /**
+     * ## Browse
+     * Find a paginated set of posts
+     *
+     * Will only return published posts unless we have an authenticated user and an alternative status
+     * parameter.
+     *
+     * Will return without static pages unless told otherwise
+     *
+     *
+     * @public
+     * @param {{context, page, limit, status, staticPages, tag, featured}} options (optional)
+     * @returns {Promise<Posts>} Posts Collection with Meta
+     */
     browse: function browse(options) {
-        options = options || {};
-        
-        // only published posts if no user is present
-        if (!this.user) {
-            options.status = 'published';
-        }
-        // **returns:** a promise for a page of posts in a json object
-        return dataProvider.Post.findPage(options).then(function (result) {
-            var i = 0,
-                omitted = result;
+        var extraOptions = ['status'],
+            permittedOptions,
+            tasks;
 
-            for (i = 0; i < omitted.posts.length; i = i + 1) {
-                omitted.posts[i].author = _.omit(omitted.posts[i].author, filteredUserAttributes);
-            }
-            return omitted;
-        });
+        // Workaround to remove static pages from results
+        // TODO: rework after https://github.com/TryGhost/Ghost/issues/5151
+        if (options && options.context && (options.context.user || options.context.internal)) {
+            extraOptions.push('staticPages');
+        }
+        permittedOptions = utils.browseDefaultOptions.concat(extraOptions);
+
+        /**
+         * ### Model Query
+         *  Make the call to the Model layer
+         * @param {Object} options
+         * @returns {Object} options
+         */
+        function modelQuery(options) {
+            return dataProvider.Post.findPage(options);
+        }
+
+        // Push all of our tasks into a `tasks` array in the correct order
+        tasks = [
+            utils.validate(docName, {opts: permittedOptions}),
+            utils.handlePublicPermissions(docName, 'browse'),
+            utils.convertOptions(allowedIncludes),
+            modelQuery
+        ];
+
+        // Pipeline calls each task passing the result of one to be the arguments for the next
+        return pipeline(tasks, options);
     },
 
-    // #### Read
-    // **takes:** an identifier (id or slug?)
+    /**
+     * ## Read
+     * Find a post, by ID, UUID, or Slug
+     *
+     * @public
+     * @param {Object} options
+     * @return {Promise<Post>} Post
+     */
     read: function read(options) {
-        options = options || {};
+        var attrs = ['id', 'slug', 'status', 'uuid'],
+            tasks;
 
-        // only published posts if no user is present
-        if (!this.user) {
-            options.status = 'published';
+        /**
+         * ### Model Query
+         * Make the call to the Model layer
+         * @param {Object} options
+         * @returns {Object} options
+         */
+        function modelQuery(options) {
+            return dataProvider.Post.findOne(options.data, _.omit(options, ['data']));
         }
 
-        // **returns:** a promise for a single post in a json object
-        return dataProvider.Post.findOne(options).then(function (result) {
-            var omitted;
+        // Push all of our tasks into a `tasks` array in the correct order
+        tasks = [
+            utils.validate(docName, {attrs: attrs}),
+            utils.handlePublicPermissions(docName, 'read'),
+            utils.convertOptions(allowedIncludes),
+            modelQuery
+        ];
 
+        // Pipeline calls each task passing the result of one to be the arguments for the next
+        return pipeline(tasks, options).then(function formatResponse(result) {
+            // @TODO make this a formatResponse task?
             if (result) {
-                omitted = result.toJSON();
-                omitted.author = _.omit(omitted.author, filteredUserAttributes);
-                return { posts: [ omitted ]};
+                return {posts: [result.toJSON(options)]};
             }
-            return when.reject({code: 404, message: 'Post not found'});
 
+            return Promise.reject(new errors.NotFoundError('Post not found.'));
         });
     },
 
-    // #### Edit
-    // **takes:** a json object with all the properties which should be updated
-    edit: function edit(postData) {
-        // **returns:** a promise for the resulting post in a json object
-        var self = this;
+    /**
+     * ## Edit
+     * Update properties of a post
+     *
+     * @public
+     * @param {Post} object Post or specific properties to update
+     * @param {{id (required), context, include,...}} options
+     * @return {Promise(Post)} Edited Post
+     */
+    edit: function edit(object, options) {
+        var tasks;
 
-        return canThis(self.user).edit.post(postData.id).then(function () {
-            return checkPostData(postData).then(function (checkedPostData) {
-                return dataProvider.Post.edit(checkedPostData.posts[0], {user: self.user});
-            }).then(function (result) {
-                if (result) {
-                    var omitted = result.toJSON();
-                    omitted.author = _.omit(omitted.author, filteredUserAttributes);
-                    return { posts: [ omitted ]};
+        /**
+         * ### Model Query
+         * Make the call to the Model layer
+         * @param {Object} options
+         * @returns {Object} options
+         */
+        function modelQuery(options) {
+            return dataProvider.Post.edit(options.data.posts[0], _.omit(options, ['data']));
+        }
+
+        // Push all of our tasks into a `tasks` array in the correct order
+        tasks = [
+            utils.validate(docName, {opts: utils.idDefaultOptions}),
+            utils.handlePermissions(docName, 'edit'),
+            utils.convertOptions(allowedIncludes),
+            modelQuery
+        ];
+
+        // Pipeline calls each task passing the result of one to be the arguments for the next
+        return pipeline(tasks, object, options).then(function formatResponse(result) {
+            if (result) {
+                var post = result.toJSON(options);
+
+                // If previously was not published and now is (or vice versa), signal the change
+                post.statusChanged = false;
+                if (result.updated('status') !== result.get('status')) {
+                    post.statusChanged = true;
                 }
-                return when.reject({code: 404, message: 'Post not found'});
-            });
-        }, function () {
-            return when.reject({code: 403, message: 'You do not have permission to edit this post.'});
+                return {posts: [post]};
+            }
+
+            return Promise.reject(new errors.NotFoundError('Post not found.'));
         });
     },
 
-    // #### Add
-    // **takes:** a json object representing a post,
-    add: function add(postData) {
-        var self = this;
-        // **returns:** a promise for the resulting post in a json object
-        return canThis(this.user).create.post().then(function () {
-            return checkPostData(postData).then(function (checkedPostData) {
-                return dataProvider.Post.add(checkedPostData.posts[0], {user: self.user});
-            }).then(function (result) {
-                var omitted = result.toJSON();
-                omitted.author = _.omit(omitted.author, filteredUserAttributes);
-                return { posts: [ omitted ]};
-            });
-        }, function () {
-            return when.reject({code: 403, message: 'You do not have permission to add posts.'});
+    /**
+     * ## Add
+     * Create a new post along with any tags
+     *
+     * @public
+     * @param {Post} object
+     * @param {{context, include,...}} options
+     * @return {Promise(Post)} Created Post
+     */
+    add: function add(object, options) {
+        var tasks;
+
+        /**
+         * ### Model Query
+         * Make the call to the Model layer
+         * @param {Object} options
+         * @returns {Object} options
+         */
+        function modelQuery(options) {
+            return dataProvider.Post.add(options.data.posts[0], _.omit(options, ['data']));
+        }
+
+        // Push all of our tasks into a `tasks` array in the correct order
+        tasks = [
+            utils.validate(docName),
+            utils.handlePermissions(docName, 'add'),
+            utils.convertOptions(allowedIncludes),
+            modelQuery
+        ];
+
+        // Pipeline calls each task passing the result of one to be the arguments for the next
+        return pipeline(tasks, object, options).then(function formatResponse(result) {
+            var post = result.toJSON(options);
+
+            if (post.status === 'published') {
+                // When creating a new post that is published right now, signal the change
+                post.statusChanged = true;
+            }
+            return {posts: [post]};
         });
     },
 
-    // #### Destroy
-    // **takes:** an identifier (id or slug?)
-    destroy: function destroy(args) {
-        var self = this;
-        // **returns:** a promise for a json response with the id of the deleted post
-        return canThis(this.user).remove.post(args.id).then(function () {
-            // TODO: Would it be good to get rid of .call()?
-            return posts.read.call({user: self.user}, {id : args.id, status: 'all'}).then(function (result) {
-                return dataProvider.Post.destroy(args.id).then(function () {
-                    var deletedObj = result;
-                    return deletedObj;
+    /**
+     * ## Destroy
+     * Delete a post, cleans up tag relations, but not unused tags
+     *
+     * @public
+     * @param {{id (required), context,...}} options
+     * @return {Promise(Post)} Deleted Post
+     */
+    destroy: function destroy(options) {
+        var tasks;
+
+        /**
+         * ### Model Query
+         * Make the call to the Model layer
+         * @param {Object} options
+         * @returns {Object} options
+         */
+        function modelQuery(options) {
+            // Removing a post needs to include all posts.
+            options.status = 'all';
+            return posts.read(options).then(function (result) {
+                return dataProvider.Post.destroy(options).then(function () {
+                    return result;
                 });
             });
-        }, function () {
-            return when.reject({code: 403, message: 'You do not have permission to remove posts.'});
-        });
-    },
+        }
 
-    // #### Generate slug
+        // Push all of our tasks into a `tasks` array in the correct order
+        tasks = [
+            utils.validate(docName, {opts: utils.idDefaultOptions}),
+            utils.handlePermissions(docName, 'destroy'),
+            utils.convertOptions(allowedIncludes),
+            modelQuery
+        ];
 
-    // **takes:** a string to generate the slug from
-    generateSlug: function generateSlug(args) {
+        // Pipeline calls each task passing the result of one to be the arguments for the next
+        return pipeline(tasks, options).then(function formatResponse(result) {
+            var deletedObj = result;
 
-        return canThis(this.user).slug.post().then(function () {
-            return dataProvider.Base.Model.generateSlug(dataProvider.Post, args.title, {status: 'all'}).then(function (slug) {
-                if (slug) {
-                    return slug;
-                }
-                return when.reject({code: 500, message: 'Could not generate slug'});
-            });
-        }, function () {
-            return when.reject({code: 403, message: 'You do not have permission.'});
+            if (deletedObj.posts) {
+                _.each(deletedObj.posts, function (post) {
+                    post.statusChanged = true;
+                });
+            }
+
+            return deletedObj;
         });
     }
-
 };
 
 module.exports = posts;
